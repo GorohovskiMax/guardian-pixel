@@ -1,0 +1,18 @@
+model:
+  backbone: convnext_large
+  num_classes: 7
+  input_resolution: 200
+
+training:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 1e-4
+  optimizer: adam
+  label_smoothing: 0.05
+  scheduler:
+    type: exponential_decay
+    decay_rate: 0.96
+    decay_steps: 1000
+
+data:
+  artifact_path: "path/to/artifact"
