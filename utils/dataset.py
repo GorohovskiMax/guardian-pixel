@@ -49,6 +49,9 @@ _UNSEEN_VAL_RATIO = 0.10
 
 _RANDOM_STATE = 42  # fixed seed — all three splits must see the same partitioning
 
+# Module-level cache so metadata CSVs are only read once per dataset root.
+_metadata_cache: dict[str, "pd.DataFrame"] = {}
+
 
 # --------------------------------------------------------------------------- #
 # Helper                                                                       #
@@ -146,9 +149,17 @@ class ArtiFactDataset(Dataset):
         """
         Walk every generator subfolder, read its metadata.csv, assign class
         labels, and return the combined DataFrame.
+
+        Results are cached by root path so three ArtiFactDataset instances
+        (train/val/test) only read the CSVs once.
         """
+        cache_key = str(self.root)
+        if cache_key in _metadata_cache:
+            return _metadata_cache[cache_key]
+
         frames: list[pd.DataFrame] = []
         skipped: list[str] = []
+        root_str = str(self.root)
 
         for gen_dir in sorted(self.root.iterdir()):
             if not gen_dir.is_dir():
@@ -159,15 +170,12 @@ class ArtiFactDataset(Dataset):
                 continue
 
             df = pd.read_csv(csv_path, usecols=["image_path", "target"])
-            df["generator"]   = gen_dir.name
-            # image_path is relative to the dataset root
-            df["abs_path"]    = df["image_path"].apply(
-                lambda p: str(self.root / p)
-            )
-            df["class_label"] = df.apply(
-                lambda row: _assign_class(gen_dir.name, int(row["target"])),
-                axis=1,
-            )
+            df["generator"] = gen_dir.name
+            # image_path is relative to the dataset root — vectorized concat
+            df["abs_path"]  = root_str + "/" + df["image_path"].astype(str)
+            # class_label: real (target==0) → 0; fake → generator-specific class
+            gen_class = _SEEN_FAKE_TO_CLASS.get(gen_dir.name, 6)
+            df["class_label"] = np.where(df["target"] == 0, 0, gen_class)
             frames.append(df[["abs_path", "generator", "class_label"]])
 
         if skipped:
@@ -178,7 +186,9 @@ class ArtiFactDataset(Dataset):
                 "Expected: <root>/<generator>/metadata.csv"
             )
 
-        return pd.concat(frames, ignore_index=True)
+        result = pd.concat(frames, ignore_index=True)
+        _metadata_cache[cache_key] = result
+        return result
 
     # ---------------------------------------------------------------------- #
     # Split construction                                                      #

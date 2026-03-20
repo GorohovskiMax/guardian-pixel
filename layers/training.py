@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import wandb
@@ -19,6 +21,15 @@ from utils.dataloader import get_dataloaders
 # train_one_epoch                                                              #
 # --------------------------------------------------------------------------- #
 
+def _set_seeds(seed: int) -> None:
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
 def train_one_epoch(
     model: ForensicDetector,
     loader: DataLoader,
@@ -28,6 +39,7 @@ def train_one_epoch(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     epoch: int,
     global_step: int,
+    use_wandb: bool = True,
 ) -> tuple[dict, int]:
     """
     Run one full pass over the training set.
@@ -70,13 +82,14 @@ def train_one_epoch(
         total += labels.size(0)
         global_step += 1
 
-        wandb.log(
-            {
-                "train/step_loss": loss.item(),
-                "train/lr": optimizer.param_groups[0]["lr"],
-            },
-            step=global_step,
-        )
+        if use_wandb:
+            wandb.log(
+                {
+                    "train/step_loss": loss.item(),
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                },
+                step=global_step,
+            )
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     return {
@@ -179,6 +192,13 @@ def train(
     s_cfg = t_cfg["scheduler"]
 
     # ------------------------------------------------------------------ #
+    # Seeds                                                                #
+    # ------------------------------------------------------------------ #
+    seed = t_cfg.get("seed", 42)
+    _set_seeds(seed)
+    print(f"[train] random seed: {seed}")
+
+    # ------------------------------------------------------------------ #
     # Device                                                               #
     # ------------------------------------------------------------------ #
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -188,7 +208,12 @@ def train(
     # W&B                                                                  #
     # ------------------------------------------------------------------ #
     run_name = wandb_run_name or cfg.get("logging", {}).get("wandb_run_name")
-    wandb.init(project=wandb_project, name=run_name, config=cfg)
+    use_wandb = True
+    try:
+        wandb.init(project=wandb_project, name=run_name, config=cfg)
+    except Exception as exc:
+        use_wandb = False
+        print(f"[train] W&B unavailable ({exc}) — training without logging.")
 
     # ------------------------------------------------------------------ #
     # Data                                                                 #
@@ -199,7 +224,8 @@ def train(
     # Model                                                                #
     # ------------------------------------------------------------------ #
     model = ForensicDetector.from_config(config_path).to(device)
-    wandb.watch(model, log="gradients", log_freq=200)
+    if use_wandb:
+        wandb.watch(model, log="gradients", log_freq=200)
 
     # ------------------------------------------------------------------ #
     # Loss                                                                 #
@@ -242,22 +268,23 @@ def train(
 
         train_metrics, global_step = train_one_epoch(
             model, loaders["train"], optimizer, criterion,
-            device, scheduler, epoch, global_step,
+            device, scheduler, epoch, global_step, use_wandb=use_wandb,
         )
 
         val_metrics = evaluate(model, loaders["val"], device)
 
-        wandb.log(
-            {
-                "epoch":                  epoch,
-                "train/epoch_loss":       train_metrics["loss"],
-                "train/epoch_accuracy":   train_metrics["accuracy"],
-                "val/loss":               val_metrics["loss"],
-                "val/accuracy":           val_metrics["accuracy"],
-                "val/balanced_accuracy":  val_metrics["balanced_accuracy"],
-            },
-            step=global_step,
-        )
+        if use_wandb:
+            wandb.log(
+                {
+                    "epoch":                  epoch,
+                    "train/epoch_loss":       train_metrics["loss"],
+                    "train/epoch_accuracy":   train_metrics["accuracy"],
+                    "val/loss":               val_metrics["loss"],
+                    "val/accuracy":           val_metrics["accuracy"],
+                    "val/balanced_accuracy":  val_metrics["balanced_accuracy"],
+                },
+                step=global_step,
+            )
 
         print(
             f"Epoch {epoch:>3}/{t_cfg['epochs']}  "
@@ -278,14 +305,18 @@ def train(
                     "scheduler_state_dict":     scheduler.state_dict(),
                     "best_balanced_accuracy":   best_bal_acc,
                     "config":                   cfg,
+                    "rng_state":                torch.get_rng_state(),
+                    "cuda_rng_state":           torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                 },
                 best_checkpoint_path,
             )
-            wandb.log(
-                {"val/best_balanced_accuracy": best_bal_acc},
-                step=global_step,
-            )
+            if use_wandb:
+                wandb.log(
+                    {"val/best_balanced_accuracy": best_bal_acc},
+                    step=global_step,
+                )
             print(f"  → checkpoint saved  (bal_acc={best_bal_acc:.4f})")
 
-    wandb.finish()
+    if use_wandb:
+        wandb.finish()
     return model

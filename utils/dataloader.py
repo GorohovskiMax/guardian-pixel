@@ -41,9 +41,9 @@ def get_dataloaders(
     """
     cfg = _load_config(config_path)
 
-    root        = Path(root or cfg["data"]["root"])
-    batch_size  = batch_size  or cfg["training"]["batch_size"]
-    num_workers = num_workers or cfg["data"]["num_workers"]
+    root        = Path(root if root is not None else cfg["data"]["root"])
+    batch_size  = batch_size  if batch_size  is not None else cfg["training"]["batch_size"]
+    num_workers = num_workers if num_workers is not None else cfg["data"]["num_workers"]
     input_res   = cfg["model"]["input_resolution"]
 
     # ------------------------------------------------------------------ #

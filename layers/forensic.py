@@ -75,6 +75,9 @@ class ForensicDetector(nn.Module):
         # reset_classifier is timm's canonical API; it replaces head.fc and
         # keeps the pooling/norm layers intact.
         self.model.reset_classifier(num_classes)
+        assert num_classes == len(CLASS_NAMES), (
+            f"num_classes={num_classes} but CLASS_NAMES has {len(CLASS_NAMES)} entries"
+        )
 
     # ---------------------------------------------------------------------- #
     # Constructor helpers                                                     #
@@ -126,9 +129,9 @@ class ForensicDetector(nn.Module):
         self.model.stem[0] = new
 
         # Sanity check — runs once at init, never again
-        assert new.out_channels == 192, (
-            f"FSR sanity check failed: expected stem out_channels=192 "
-            f"(convnext_large), got {new.out_channels}"
+        assert new.out_channels == old.out_channels, (
+            f"FSR sanity check failed: stem out_channels changed from "
+            f"{old.out_channels} to {new.out_channels}"
         )
         print(f"[FSR] stem[0] after modification: {self.model.stem[0]}")
 

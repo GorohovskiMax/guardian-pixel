@@ -5,6 +5,7 @@ model:
   fsr: true
 
 training:
+  seed: 42
   epochs: 50
   batch_size: 32
   learning_rate: 1e-4
@@ -20,6 +21,5 @@ logging:
   wandb_run_name: "layer_a_fsr_v1"
 
 data:
-  artifact_path: "path/to/artifact"
-  root: "data/raw"
+  root: "data/raw"  # placeholder — always overridden at call site
   num_workers: 4
