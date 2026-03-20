@@ -89,8 +89,9 @@ class ArtiFactDataset(Dataset):
             <images …>
           …
 
-    ``image_path`` values in each CSV are interpreted as relative to ``root``
-    (the dataset root), not to the individual generator subfolder.
+    ``image_path`` values in each CSV are relative to the individual generator
+    subfolder (e.g. ``img000001.jpg`` inside ``stylegan2/``), so absolute paths
+    are constructed as ``root / generator_name / image_path``.
 
     Class mapping
     -------------
@@ -171,8 +172,8 @@ class ArtiFactDataset(Dataset):
 
             df = pd.read_csv(csv_path, usecols=["image_path", "target"])
             df["generator"] = gen_dir.name
-            # image_path is relative to the dataset root — vectorized concat
-            df["abs_path"]  = root_str + "/" + df["image_path"].astype(str)
+            # image_path is relative to the generator subfolder, not the root
+            df["abs_path"]  = root_str + "/" + gen_dir.name + "/" + df["image_path"].astype(str)
             # class_label: real (target==0) → 0; fake → generator-specific class
             gen_class = _SEEN_FAKE_TO_CLASS.get(gen_dir.name, 6)
             df["class_label"] = np.where(df["target"] == 0, 0, gen_class)
