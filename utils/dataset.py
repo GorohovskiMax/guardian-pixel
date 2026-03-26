@@ -27,6 +27,40 @@ NUM_CLASSES = len(CLASS_NAMES)
 
 
 # --------------------------------------------------------------------------- #
+# Path resolution                                                              #
+# --------------------------------------------------------------------------- #
+
+def _build_prefix_map(artifact_root: Path) -> dict[str, str]:
+    """
+    Scan one level deep under artifact_root and return a mapping from
+    subfolder name → parent folder name for any subfolder that is NOT itself
+    a top-level folder.
+
+    Example: artifact_root/glide/glide-t2i/ exists but glide-t2i/ does not
+    exist at the top level, so the map contains {"glide-t2i": "glide"}.
+
+    This lets us resolve CSV image_path values that are relative to a
+    generator parent folder rather than to artifact_root directly.
+    """
+    top_level = {p.name for p in artifact_root.iterdir() if p.is_dir()}
+    prefix_map: dict[str, str] = {}
+    for folder in top_level:
+        for sub in (artifact_root / folder).iterdir():
+            if sub.is_dir() and sub.name not in top_level:
+                prefix_map[sub.name] = folder
+    return prefix_map
+
+
+def _resolve_path(artifact_root: Path, image_path: str, prefix_map: dict[str, str]) -> str:
+    """Return the absolute path for an image, inserting a parent folder when needed."""
+    prefix = image_path.split("/")[0]
+    parent = prefix_map.get(prefix, "")
+    if parent:
+        return str(artifact_root / parent / image_path)
+    return str(artifact_root / image_path)
+
+
+# --------------------------------------------------------------------------- #
 # Dataset                                                                      #
 # --------------------------------------------------------------------------- #
 
@@ -74,10 +108,16 @@ class ArtiFactDataset(Dataset):
 
         df = self._load_split(Path(csv_path), split)
 
+        # Some generators are nested one level inside a parent folder on disk
+        # (e.g. image_path starts with "glide-t2i/" but on disk the file lives
+        # under "glide/glide-t2i/").  Build a one-time prefix map at startup
+        # to resolve these transparently without touching the CSV.
+        prefix_map = _build_prefix_map(self.artifact_root)
+
         # Each sample is a (absolute_image_path, class_label) tuple.
         self.samples: list[tuple[str, int]] = list(
             zip(
-                (str(self.artifact_root / p) for p in df["image_path"]),
+                (_resolve_path(self.artifact_root, p, prefix_map) for p in df["image_path"]),
                 df["target"].tolist(),
             )
         )
@@ -94,7 +134,7 @@ class ArtiFactDataset(Dataset):
                 f"master_metadata.csv not found at: {csv_path}\n"
                 "Make sure Google Drive is mounted and the path is correct."
             )
-        df = pd.read_csv(csv_path, usecols=["image_path", "target", "split"])
+        df = pd.read_csv(csv_path, usecols=["image_path", "target", "split"], low_memory=False)
         subset = df[df["split"] == split].reset_index(drop=True)
         if len(subset) == 0:
             raise ValueError(
