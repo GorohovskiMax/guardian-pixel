@@ -33,7 +33,7 @@ def get_transforms(split: str, input_resolution: int = 200) -> A.Compose:
             # Simulate social-media JPEG re-compression (ArtiFact paper §3.2).
             # quality_lower=65 matches the paper's minimum; applied stochastically
             # so the model sees both compressed and uncompressed examples.
-            A.ImageCompression(quality_lower=65, quality_upper=100, p=0.5),
+            A.ImageCompression(quality=(65, 100), p=0.5),
             A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ToTensorV2(),
         ])
