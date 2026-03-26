@@ -18,8 +18,7 @@ def get_transforms(split: str, input_resolution: int = 200) -> A.Compose:
     if split == "train":
         return A.Compose([
             A.RandomResizedCrop(
-                height=input_resolution,
-                width=input_resolution,
+                size=(input_resolution, input_resolution),
                 scale=(0.8, 1.0),
                 ratio=(0.75, 1.33),
             ),
