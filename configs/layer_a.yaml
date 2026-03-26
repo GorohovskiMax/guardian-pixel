@@ -21,6 +21,7 @@ training:
   # short enough to finish comfortably within a Colab Pro session while
   # still providing balanced, diverse training signal every epoch.
   samples_per_epoch: 500000
+  early_stopping_patience: 3
 
 logging:
   wandb_run_name: "layer_a_fsr_v1"

@@ -72,7 +72,7 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+        with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
             logits = model(images)
             loss   = criterion(logits, labels)
 
@@ -147,7 +147,7 @@ def evaluate(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
                 logits = model(images)
 
             running_loss += criterion(logits, labels).item()
@@ -297,7 +297,7 @@ def train(
     # ------------------------------------------------------------------ #
     # AMP scaler — scales loss to prevent float16 underflow               #
     # ------------------------------------------------------------------ #
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == "cuda")
 
     # ------------------------------------------------------------------ #
     # Checkpoint                                                           #
@@ -306,6 +306,12 @@ def train(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_checkpoint_path = checkpoint_dir / "best.pt"
     best_bal_acc = 0.0
+
+    # ------------------------------------------------------------------ #
+    # Early stopping                                                       #
+    # ------------------------------------------------------------------ #
+    patience         = t_cfg.get("early_stopping_patience", 3)
+    epochs_no_improve = 0
 
     # ------------------------------------------------------------------ #
     # Training loop                                                        #
@@ -350,7 +356,8 @@ def train(
         )
 
         if val_metrics["balanced_accuracy"] > best_bal_acc:
-            best_bal_acc = val_metrics["balanced_accuracy"]
+            best_bal_acc      = val_metrics["balanced_accuracy"]
+            epochs_no_improve = 0
             torch.save(
                 {
                     "epoch":                  epoch,
@@ -368,6 +375,13 @@ def train(
             if use_wandb:
                 wandb.log({"val/best_balanced_accuracy": best_bal_acc}, step=global_step)
             print(f"  → checkpoint saved  (bal_acc={best_bal_acc:.4f})")
+        else:
+            epochs_no_improve += 1
+            print(f"  → no improvement ({epochs_no_improve}/{patience})")
+            if epochs_no_improve >= patience:
+                print(f"Early stopping: val balanced accuracy has not improved "
+                      f"for {patience} consecutive epochs. Best: {best_bal_acc:.4f}")
+                break
 
     if use_wandb:
         wandb.finish()
