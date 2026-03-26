@@ -21,5 +21,7 @@ logging:
   wandb_run_name: "layer_a_fsr_v1"
 
 data:
-  root: "data/raw"  # placeholder — always overridden at call site
+  # Overridden at runtime in the notebook — these are fallback placeholders only.
+  csv_path:      "/content/drive/MyDrive/Kaggle_Datasets/master_metadata.csv"
+  artifact_root: "/content/ArtiFact"
   num_workers: 4

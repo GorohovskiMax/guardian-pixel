@@ -13,23 +13,27 @@ from .transforms import get_transforms
 
 def get_dataloaders(
     config_path: str | Path,
-    root: Optional[str | Path] = None,
+    csv_path: Optional[str | Path] = None,
+    artifact_root: Optional[str | Path] = None,
     batch_size: Optional[int] = None,
     num_workers: Optional[int] = None,
 ) -> dict[str, DataLoader]:
     """
-    Build train / val / test DataLoaders for the ArtiFact dataset.
+    Build train / validation / test DataLoaders for the ArtiFact dataset.
 
-    Reads ``batch_size``, ``num_workers``, ``data.root``, and
-    ``model.input_resolution`` from the YAML config.  Any of the
-    keyword arguments override the config values when provided.
+    Reads ``batch_size``, ``num_workers``, ``data.csv_path``,
+    ``data.artifact_root``, and ``model.input_resolution`` from the YAML
+    config.  ``csv_path``, ``artifact_root``, ``batch_size``, and
+    ``num_workers`` may be overridden at call time.
 
     Parameters
     ----------
     config_path : str | Path
         Path to a layer config YAML (e.g. ``configs/layer_a.yaml``).
-    root : str | Path, optional
-        Dataset root directory override.
+    csv_path : str | Path, optional
+        Path to master_metadata.csv — overrides ``data.csv_path`` in config.
+    artifact_root : str | Path, optional
+        ArtiFact extraction root — overrides ``data.artifact_root`` in config.
     batch_size : int, optional
         Override config ``training.batch_size``.
     num_workers : int, optional
@@ -37,35 +41,37 @@ def get_dataloaders(
 
     Returns
     -------
-    dict with keys ``"train"``, ``"val"``, ``"test"`` mapping to DataLoaders.
+    dict with keys ``"train"``, ``"validation"``, ``"test"`` mapping to DataLoaders.
     """
     cfg = _load_config(config_path)
+    d_cfg = cfg["data"]
 
-    root        = Path(root if root is not None else cfg["data"]["root"])
-    batch_size  = batch_size  if batch_size  is not None else cfg["training"]["batch_size"]
-    num_workers = num_workers if num_workers is not None else cfg["data"]["num_workers"]
-    input_res   = cfg["model"]["input_resolution"]
+    csv_path      = Path(csv_path      if csv_path      is not None else d_cfg["csv_path"])
+    artifact_root = Path(artifact_root if artifact_root is not None else d_cfg["artifact_root"])
+    batch_size    = batch_size  if batch_size  is not None else cfg["training"]["batch_size"]
+    num_workers   = num_workers if num_workers is not None else d_cfg["num_workers"]
+    input_res     = cfg["model"]["input_resolution"]
 
     # ------------------------------------------------------------------ #
     # Datasets                                                             #
     # ------------------------------------------------------------------ #
     datasets = {
         split: ArtiFactDataset(
-            root=root,
+            csv_path=csv_path,
+            artifact_root=artifact_root,
             split=split,
             transform=get_transforms(split, input_resolution=input_res),
         )
-        for split in ("train", "val", "test")
+        for split in ("train", "validation", "test")
     }
 
     # ------------------------------------------------------------------ #
     # Weighted sampler — inverse class frequency on the training set       #
     # ------------------------------------------------------------------ #
     #
-    # The Unseen class has very few training samples relative to the other
-    # six classes.  WeightedRandomSampler rebalances this by sampling each
-    # example with probability proportional to 1 / (class count), so every
-    # class contributes roughly equally to each training epoch.
+    # The training set is imbalanced across the 7 classes.
+    # WeightedRandomSampler rebalances this so each class contributes
+    # roughly equally to every epoch.
     #
     train_sampler = _make_weighted_sampler(datasets["train"])
 
@@ -81,10 +87,10 @@ def get_dataloaders(
             sampler=train_sampler,   # mutually exclusive with shuffle=True
             num_workers=num_workers,
             pin_memory=pin,
-            drop_last=True,          # keeps batch sizes uniform during training
+            drop_last=True,
         ),
-        "val": DataLoader(
-            datasets["val"],
+        "validation": DataLoader(
+            datasets["validation"],
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
@@ -117,10 +123,9 @@ def _load_config(config_path: str | Path) -> dict:
 def _make_weighted_sampler(dataset: ArtiFactDataset) -> WeightedRandomSampler:
     """
     Compute per-sample weights as the inverse frequency of their class,
-    then return a WeightedRandomSampler over the full dataset length.
+    then return a WeightedRandomSampler over the full training set.
     """
-    counts = dataset.get_class_counts()          # list[int], one per class
-    # Guard against classes with zero samples (e.g. Unseen absent from train)
+    counts = dataset.get_class_counts()
     class_weights = [
         1.0 / count if count > 0 else 0.0
         for count in counts

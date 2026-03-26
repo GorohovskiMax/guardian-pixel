@@ -1,13 +1,12 @@
-from __future__ import annotations
+from __future__ import annotations # allow class methods to reference the class itself in type hints without string literals
 
-from pathlib import Path
-from typing import Union
+from pathlib import Path # A convenient class for handling filesystem paths, used for loading config files
 
 import numpy as np
-import timm
-import torch
-import torch.nn as nn
-import yaml
+import timm # A popular library of pretrained vision models, used here to load ConvNeXt-Large with ImageNet weights
+import torch # Gives access to everything PyTorch offers - creating tensors, moving data to GPU, saving and loading models, math operations.
+import torch.nn as nn # Stands for neural networks, it's a submodule of PyTorch that contains specifically the building blocks for constructing neural network architectures.
+import yaml # A library for parsing YAML files, esentially a file format for writing configuration and settings in a very human-readable way
 from PIL import Image
 
 from utils.dataset import CLASS_NAMES
@@ -159,7 +158,7 @@ class ForensicDetector(nn.Module):
     # Predict — inference path                                                #
     # ---------------------------------------------------------------------- #
 
-    def predict(self, image: Union[Image.Image, np.ndarray]) -> dict:
+    def predict(self, image: Image.Image | np.ndarray) -> dict:
         """
         Run inference on a single image.
 
@@ -210,7 +209,7 @@ class ForensicDetector(nn.Module):
         return next(self.parameters()).device
 
     @staticmethod
-    def _to_numpy_rgb(image: Union[Image.Image, np.ndarray]) -> np.ndarray:
+    def _to_numpy_rgb(image: Image.Image | np.ndarray) -> np.ndarray:
         """Normalise any input image to HWC uint8 numpy RGB."""
         if isinstance(image, Image.Image):
             return np.array(image.convert("RGB"))

@@ -2,33 +2,42 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import wandb
 import yaml
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from layers.forensic import ForensicDetector
 from utils.dataloader import get_dataloaders
+from utils.dataset import CLASS_NAMES
 
 
 # --------------------------------------------------------------------------- #
-# train_one_epoch                                                              #
+# Reproducibility                                                              #
 # --------------------------------------------------------------------------- #
 
 def _set_seeds(seed: int) -> None:
-    """Set all random seeds for reproducibility."""
+    """Fix all random seeds for reproducible training."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
+
+# --------------------------------------------------------------------------- #
+# train_one_epoch                                                              #
+# --------------------------------------------------------------------------- #
 
 def train_one_epoch(
     model: ForensicDetector,
@@ -47,18 +56,12 @@ def train_one_epoch(
     The scheduler is stepped once per batch (not per epoch) to honour the
     step-based ``decay_steps`` parameter in the config.
 
-    Parameters
-    ----------
-    global_step : int
-        Running batch counter passed in from the outer loop so that W&B
-        step numbers are consistent across epochs.
-
     Returns
     -------
     metrics : dict
         ``loss`` and ``accuracy`` averaged over the epoch.
     global_step : int
-        Updated counter after this epoch's batches.
+        Updated running batch counter.
     """
     model.train()
     running_loss = 0.0
@@ -75,7 +78,7 @@ def train_one_epoch(
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
-        scheduler.step()   # step-level decay
+        scheduler.step()
 
         running_loss += loss.item()
         correct += (logits.argmax(dim=1) == labels).sum().item()
@@ -93,7 +96,7 @@ def train_one_epoch(
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     return {
-        "loss": running_loss / len(loader),
+        "loss":     running_loss / len(loader),
         "accuracy": correct / total,
     }, global_step
 
@@ -108,23 +111,37 @@ def evaluate(
     device: torch.device,
 ) -> dict:
     """
-    Evaluate the model and return loss, accuracy, and balanced accuracy.
+    Evaluate the model and return a comprehensive set of metrics.
 
-    Balanced accuracy is the macro-average of per-class recall, computed via
-    ``sklearn.metrics.balanced_accuracy_score``.  It is the primary metric
-    for checkpoint selection because the Unseen class is severely imbalanced
-    in the val split.
+    7-class metrics
+    ---------------
+    - loss                  Cross-entropy loss averaged over batches
+    - accuracy              Overall accuracy across all 7 classes
+    - balanced_accuracy     Macro-average per-class recall (primary metric for
+                            checkpoint selection — robust to class imbalance)
+    - per_class_report      Per-class precision, recall, F1 (dict from
+                            sklearn classification_report)
+    - confusion_matrix      7×7 numpy array
 
-    Returns
-    -------
-    dict with keys: ``loss``, ``accuracy``, ``balanced_accuracy``.
+    Binary metrics (Real vs. Fake)
+    --------------------------------
+    Any prediction with label > 0 is collapsed to "fake" (1); label == 0
+    stays "real" (0).  This mirrors the external binary output of the system.
+
+    - binary_accuracy       Binary classification accuracy
+    - binary_precision      Precision for the fake class
+    - binary_recall         Recall for the fake class (= detection rate)
+    - binary_f1             F1 score for the fake class
+    - binary_roc_auc        Area under the ROC curve using the fake-class
+                            probability (1 − P(Real))
     """
     model.eval()
 
-    criterion = nn.CrossEntropyLoss()  # no label smoothing for eval
+    criterion = nn.CrossEntropyLoss()
     running_loss = 0.0
-    all_preds: list[int] = []
-    all_labels: list[int] = []
+    all_preds:  list[int]   = []
+    all_labels: list[int]   = []
+    all_probs:  list[float] = []  # P(fake) = 1 − P(Real) for ROC-AUC
 
     with torch.no_grad():
         for images, labels in tqdm(loader, desc="Evaluating", leave=False):
@@ -134,13 +151,66 @@ def evaluate(
             logits = model(images)
             running_loss += criterion(logits, labels).item()
 
+            probs = torch.softmax(logits, dim=1)
+            all_probs.extend((1.0 - probs[:, 0]).cpu().tolist())
             all_preds.extend(logits.argmax(dim=1).cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
 
+    # ------------------------------------------------------------------ #
+    # 7-class metrics                                                      #
+    # ------------------------------------------------------------------ #
+    accuracy     = sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels)
+    bal_accuracy = balanced_accuracy_score(all_labels, all_preds)
+    cm           = confusion_matrix(all_labels, all_preds, labels=list(range(len(CLASS_NAMES))))
+
+    # Only include classes that actually appear in the split
+    present_classes = sorted(set(all_labels))
+    present_names   = [CLASS_NAMES[i] for i in present_classes]
+    per_class = classification_report(
+        all_labels, all_preds,
+        labels=present_classes,
+        target_names=present_names,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Binary collapse: 0 = Real, 1 = Fake                                 #
+    # ------------------------------------------------------------------ #
+    binary_labels = [0 if l == 0 else 1 for l in all_labels]
+    binary_preds  = [0 if p == 0 else 1 for p in all_preds]
+
+    bin_tp = sum(p == 1 and l == 1 for p, l in zip(binary_preds, binary_labels))
+    bin_fp = sum(p == 1 and l == 0 for p, l in zip(binary_preds, binary_labels))
+    bin_fn = sum(p == 0 and l == 1 for p, l in zip(binary_preds, binary_labels))
+    bin_tn = sum(p == 0 and l == 0 for p, l in zip(binary_preds, binary_labels))
+
+    binary_accuracy  = (bin_tp + bin_tn) / len(binary_labels)
+    binary_precision = bin_tp / (bin_tp + bin_fp) if (bin_tp + bin_fp) > 0 else 0.0
+    binary_recall    = bin_tp / (bin_tp + bin_fn) if (bin_tp + bin_fn) > 0 else 0.0
+    binary_f1        = (
+        2 * binary_precision * binary_recall / (binary_precision + binary_recall)
+        if (binary_precision + binary_recall) > 0 else 0.0
+    )
+
+    try:
+        binary_roc_auc = roc_auc_score(binary_labels, all_probs)
+    except ValueError:
+        binary_roc_auc = float("nan")  # only one class present in split
+
     return {
+        # 7-class
         "loss":              running_loss / len(loader),
-        "accuracy":          sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels),
-        "balanced_accuracy": balanced_accuracy_score(all_labels, all_preds),
+        "accuracy":          accuracy,
+        "balanced_accuracy": bal_accuracy,
+        "per_class_report":  per_class,
+        "confusion_matrix":  cm,
+        # binary
+        "binary_accuracy":   binary_accuracy,
+        "binary_precision":  binary_precision,
+        "binary_recall":     binary_recall,
+        "binary_f1":         binary_f1,
+        "binary_roc_auc":    binary_roc_auc,
     }
 
 
@@ -150,39 +220,37 @@ def evaluate(
 
 def train(
     config_path: str | Path,
-    data_root: Optional[str | Path] = None,
+    csv_path: str | Path,
+    artifact_root: str | Path,
     wandb_project: str = "guardian-pixel",
-    wandb_run_name: Optional[str] = None,
+    wandb_run_name: str = None,
 ) -> ForensicDetector:
     """
     Full training run for ForensicDetector.
 
-    Reads all hyperparameters from ``config_path``.  ``data_root`` and
-    ``wandb_run_name`` may be overridden at call time (useful in Colab where
-    the Drive path differs from the default config value).
-
-    Checkpoint strategy
-    -------------------
-    A single ``best.pt`` file is kept under ``training.checkpoint_dir``.
-    It is overwritten whenever val balanced accuracy improves, so the file
-    always holds the best weights seen so far.
+    Training uses the ``train`` split from master_metadata.csv.
+    After each epoch, the model is evaluated on the ``validation`` split.
+    The best checkpoint (highest validation balanced accuracy) is saved to
+    ``training.checkpoint_dir/best.pt``.
 
     Parameters
     ----------
     config_path : str | Path
         Path to a layer config YAML (e.g. ``configs/layer_a.yaml``).
-    data_root : str | Path, optional
-        Override ``data.root`` from the config (e.g. a Google Drive path).
+    csv_path : str | Path
+        Path to master_metadata.csv.
+    artifact_root : str | Path
+        Root directory where ArtiFact was unzipped (e.g. /content/ArtiFact).
     wandb_project : str
-        W&B project name.
+        Weights & Biases project name.
     wandb_run_name : str, optional
-        Human-readable run name for W&B.
+        Human-readable W&B run name (overrides config value if provided).
 
     Returns
     -------
     ForensicDetector
         The model in its final (last-epoch) state.
-        Load ``best.pt`` separately if you need the best checkpoint.
+        Load ``best.pt`` separately if you need the best-checkpoint weights.
     """
     config_path = Path(config_path)
     with config_path.open() as f:
@@ -196,7 +264,7 @@ def train(
     # ------------------------------------------------------------------ #
     seed = t_cfg.get("seed", 42)
     _set_seeds(seed)
-    print(f"[train] random seed: {seed}")
+    print(f"[train] seed: {seed}")
 
     # ------------------------------------------------------------------ #
     # Device                                                               #
@@ -218,7 +286,7 @@ def train(
     # ------------------------------------------------------------------ #
     # Data                                                                 #
     # ------------------------------------------------------------------ #
-    loaders = get_dataloaders(config_path, root=data_root)
+    loaders = get_dataloaders(config_path, csv_path=csv_path, artifact_root=artifact_root)
 
     # ------------------------------------------------------------------ #
     # Model                                                                #
@@ -238,11 +306,10 @@ def train(
     optimizer = torch.optim.Adam(model.parameters(), lr=t_cfg["learning_rate"])
 
     # ------------------------------------------------------------------ #
-    # Scheduler — continuous exponential decay, applied per batch         #
+    # Scheduler — exponential decay applied per batch                     #
     #                                                                      #
-    # Formula: lr = lr_0 * decay_rate ^ (step / decay_steps)             #
-    # This matches the TF/Keras ExponentialDecay semantics used in the    #
-    # ArtiFact paper.  At step=0 the multiplier is exactly 1.0.           #
+    # lr = lr_0 × decay_rate ^ (step / decay_steps)                       #
+    # Matches TF/Keras ExponentialDecay semantics from the ArtiFact paper. #
     # ------------------------------------------------------------------ #
     decay_rate  = s_cfg["decay_rate"]
     decay_steps = s_cfg["decay_steps"]
@@ -254,13 +321,13 @@ def train(
     # ------------------------------------------------------------------ #
     # Checkpoint                                                           #
     # ------------------------------------------------------------------ #
-    checkpoint_dir = Path(t_cfg.get("checkpoint_dir", "models"))
+    checkpoint_dir = Path(t_cfg.get("checkpoint_dir", "models/layer_a"))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_checkpoint_path = checkpoint_dir / "best.pt"
     best_bal_acc = 0.0
 
     # ------------------------------------------------------------------ #
-    # Loop                                                                 #
+    # Training loop                                                        #
     # ------------------------------------------------------------------ #
     global_step = 0
 
@@ -271,17 +338,22 @@ def train(
             device, scheduler, epoch, global_step, use_wandb=use_wandb,
         )
 
-        val_metrics = evaluate(model, loaders["val"], device)
+        val_metrics = evaluate(model, loaders["validation"], device)
 
         if use_wandb:
             wandb.log(
                 {
-                    "epoch":                  epoch,
-                    "train/epoch_loss":       train_metrics["loss"],
-                    "train/epoch_accuracy":   train_metrics["accuracy"],
-                    "val/loss":               val_metrics["loss"],
-                    "val/accuracy":           val_metrics["accuracy"],
-                    "val/balanced_accuracy":  val_metrics["balanced_accuracy"],
+                    "epoch":                      epoch,
+                    "train/epoch_loss":           train_metrics["loss"],
+                    "train/epoch_accuracy":       train_metrics["accuracy"],
+                    "val/loss":                   val_metrics["loss"],
+                    "val/accuracy":               val_metrics["accuracy"],
+                    "val/balanced_accuracy":      val_metrics["balanced_accuracy"],
+                    "val/binary_accuracy":        val_metrics["binary_accuracy"],
+                    "val/binary_precision":       val_metrics["binary_precision"],
+                    "val/binary_recall":          val_metrics["binary_recall"],
+                    "val/binary_f1":              val_metrics["binary_f1"],
+                    "val/binary_roc_auc":         val_metrics["binary_roc_auc"],
                 },
                 step=global_step,
             )
@@ -291,30 +363,29 @@ def train(
             f"train_loss={train_metrics['loss']:.4f}  "
             f"val_loss={val_metrics['loss']:.4f}  "
             f"val_bal_acc={val_metrics['balanced_accuracy']:.4f}  "
+            f"val_bin_f1={val_metrics['binary_f1']:.4f}  "
+            f"val_roc_auc={val_metrics['binary_roc_auc']:.4f}  "
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        # Save best checkpoint
+        # Save checkpoint whenever validation balanced accuracy improves
         if val_metrics["balanced_accuracy"] > best_bal_acc:
             best_bal_acc = val_metrics["balanced_accuracy"]
             torch.save(
                 {
-                    "epoch":                    epoch,
-                    "model_state_dict":         model.state_dict(),
-                    "optimizer_state_dict":     optimizer.state_dict(),
-                    "scheduler_state_dict":     scheduler.state_dict(),
-                    "best_balanced_accuracy":   best_bal_acc,
-                    "config":                   cfg,
-                    "rng_state":                torch.get_rng_state(),
-                    "cuda_rng_state":           torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    "epoch":                  epoch,
+                    "model_state_dict":       model.state_dict(),
+                    "optimizer_state_dict":   optimizer.state_dict(),
+                    "scheduler_state_dict":   scheduler.state_dict(),
+                    "best_balanced_accuracy": best_bal_acc,
+                    "config":                 cfg,
+                    "rng_state":              torch.get_rng_state(),
+                    "cuda_rng_state":         torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                 },
                 best_checkpoint_path,
             )
             if use_wandb:
-                wandb.log(
-                    {"val/best_balanced_accuracy": best_bal_acc},
-                    step=global_step,
-                )
+                wandb.log({"val/best_balanced_accuracy": best_bal_acc}, step=global_step)
             print(f"  → checkpoint saved  (bal_acc={best_bal_acc:.4f})")
 
     if use_wandb:
