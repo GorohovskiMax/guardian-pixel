@@ -46,22 +46,20 @@ def train_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.cuda.amp.GradScaler,
     epoch: int,
     global_step: int,
     use_wandb: bool = True,
 ) -> tuple[dict, int]:
     """
-    Run one full pass over the training set.
+    Run one full pass over the training set with automatic mixed precision (AMP).
+
+    AMP runs the forward pass in float16, cutting VRAM usage by ~2x and
+    speeding up GPU kernels on modern hardware.  The GradScaler handles
+    loss scaling to keep float16 gradients numerically stable.
 
     The scheduler is stepped once per batch (not per epoch) to honour the
     step-based ``decay_steps`` parameter in the config.
-
-    Returns
-    -------
-    metrics : dict
-        ``loss`` and ``accuracy`` averaged over the epoch.
-    global_step : int
-        Updated running batch counter.
     """
     model.train()
     running_loss = 0.0
@@ -74,10 +72,13 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        logits = model(images)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
+        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            logits = model(images)
+            loss   = criterion(logits, labels)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
 
         running_loss += loss.item()
@@ -119,8 +120,7 @@ def evaluate(
     - accuracy              Overall accuracy across all 7 classes
     - balanced_accuracy     Macro-average per-class recall (primary metric for
                             checkpoint selection — robust to class imbalance)
-    - per_class_report      Per-class precision, recall, F1 (dict from
-                            sklearn classification_report)
+    - per_class_report      Per-class precision, recall, F1
     - confusion_matrix      7×7 numpy array
 
     Binary metrics (Real vs. Fake)
@@ -132,8 +132,7 @@ def evaluate(
     - binary_precision      Precision for the fake class
     - binary_recall         Recall for the fake class (= detection rate)
     - binary_f1             F1 score for the fake class
-    - binary_roc_auc        Area under the ROC curve using the fake-class
-                            probability (1 − P(Real))
+    - binary_roc_auc        Area under the ROC curve
     """
     model.eval()
 
@@ -141,17 +140,19 @@ def evaluate(
     running_loss = 0.0
     all_preds:  list[int]   = []
     all_labels: list[int]   = []
-    all_probs:  list[float] = []  # P(fake) = 1 − P(Real) for ROC-AUC
+    all_probs:  list[float] = []
 
     with torch.no_grad():
         for images, labels in tqdm(loader, desc="Evaluating", leave=False):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            logits = model(images)
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                logits = model(images)
+
             running_loss += criterion(logits, labels).item()
 
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(logits.float(), dim=1)
             all_probs.extend((1.0 - probs[:, 0]).cpu().tolist())
             all_preds.extend(logits.argmax(dim=1).cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
@@ -163,7 +164,6 @@ def evaluate(
     bal_accuracy = balanced_accuracy_score(all_labels, all_preds)
     cm           = confusion_matrix(all_labels, all_preds, labels=list(range(len(CLASS_NAMES))))
 
-    # Only include classes that actually appear in the split
     present_classes = sorted(set(all_labels))
     present_names   = [CLASS_NAMES[i] for i in present_classes]
     per_class = classification_report(
@@ -196,16 +196,14 @@ def evaluate(
     try:
         binary_roc_auc = roc_auc_score(binary_labels, all_probs)
     except ValueError:
-        binary_roc_auc = float("nan")  # only one class present in split
+        binary_roc_auc = float("nan")
 
     return {
-        # 7-class
         "loss":              running_loss / len(loader),
         "accuracy":          accuracy,
         "balanced_accuracy": bal_accuracy,
         "per_class_report":  per_class,
         "confusion_matrix":  cm,
-        # binary
         "binary_accuracy":   binary_accuracy,
         "binary_precision":  binary_precision,
         "binary_recall":     binary_recall,
@@ -232,25 +230,6 @@ def train(
     After each epoch, the model is evaluated on the ``validation`` split.
     The best checkpoint (highest validation balanced accuracy) is saved to
     ``training.checkpoint_dir/best.pt``.
-
-    Parameters
-    ----------
-    config_path : str | Path
-        Path to a layer config YAML (e.g. ``configs/layer_a.yaml``).
-    csv_path : str | Path
-        Path to master_metadata.csv.
-    artifact_root : str | Path
-        Root directory where ArtiFact was unzipped (e.g. /content/ArtiFact).
-    wandb_project : str
-        Weights & Biases project name.
-    wandb_run_name : str, optional
-        Human-readable W&B run name (overrides config value if provided).
-
-    Returns
-    -------
-    ForensicDetector
-        The model in its final (last-epoch) state.
-        Load ``best.pt`` separately if you need the best-checkpoint weights.
     """
     config_path = Path(config_path)
     with config_path.open() as f:
@@ -307,9 +286,6 @@ def train(
 
     # ------------------------------------------------------------------ #
     # Scheduler — exponential decay applied per batch                     #
-    #                                                                      #
-    # lr = lr_0 × decay_rate ^ (step / decay_steps)                       #
-    # Matches TF/Keras ExponentialDecay semantics from the ArtiFact paper. #
     # ------------------------------------------------------------------ #
     decay_rate  = s_cfg["decay_rate"]
     decay_steps = s_cfg["decay_steps"]
@@ -317,6 +293,11 @@ def train(
         optimizer,
         lr_lambda=lambda step: decay_rate ** (step / decay_steps),
     )
+
+    # ------------------------------------------------------------------ #
+    # AMP scaler — scales loss to prevent float16 underflow               #
+    # ------------------------------------------------------------------ #
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     # ------------------------------------------------------------------ #
     # Checkpoint                                                           #
@@ -335,7 +316,7 @@ def train(
 
         train_metrics, global_step = train_one_epoch(
             model, loaders["train"], optimizer, criterion,
-            device, scheduler, epoch, global_step, use_wandb=use_wandb,
+            device, scheduler, scaler, epoch, global_step, use_wandb=use_wandb,
         )
 
         val_metrics = evaluate(model, loaders["validation"], device)
@@ -368,7 +349,6 @@ def train(
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        # Save checkpoint whenever validation balanced accuracy improves
         if val_metrics["balanced_accuracy"] > best_bal_acc:
             best_bal_acc = val_metrics["balanced_accuracy"]
             torch.save(
@@ -377,6 +357,7 @@ def train(
                     "model_state_dict":       model.state_dict(),
                     "optimizer_state_dict":   optimizer.state_dict(),
                     "scheduler_state_dict":   scheduler.state_dict(),
+                    "scaler_state_dict":      scaler.state_dict(),
                     "best_balanced_accuracy": best_bal_acc,
                     "config":                 cfg,
                     "rng_state":              torch.get_rng_state(),

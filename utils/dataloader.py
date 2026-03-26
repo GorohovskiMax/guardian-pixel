@@ -22,22 +22,8 @@ def get_dataloaders(
     Build train / validation / test DataLoaders for the ArtiFact dataset.
 
     Reads ``batch_size``, ``num_workers``, ``data.csv_path``,
-    ``data.artifact_root``, and ``model.input_resolution`` from the YAML
-    config.  ``csv_path``, ``artifact_root``, ``batch_size``, and
-    ``num_workers`` may be overridden at call time.
-
-    Parameters
-    ----------
-    config_path : str | Path
-        Path to a layer config YAML (e.g. ``configs/layer_a.yaml``).
-    csv_path : str | Path, optional
-        Path to master_metadata.csv — overrides ``data.csv_path`` in config.
-    artifact_root : str | Path, optional
-        ArtiFact extraction root — overrides ``data.artifact_root`` in config.
-    batch_size : int, optional
-        Override config ``training.batch_size``.
-    num_workers : int, optional
-        Override config ``data.num_workers``.
+    ``data.artifact_root``, ``model.input_resolution``, and
+    ``training.samples_per_epoch`` from the YAML config.
 
     Returns
     -------
@@ -46,11 +32,12 @@ def get_dataloaders(
     cfg = _load_config(config_path)
     d_cfg = cfg["data"]
 
-    csv_path      = Path(csv_path      if csv_path      is not None else d_cfg["csv_path"])
-    artifact_root = Path(artifact_root if artifact_root is not None else d_cfg["artifact_root"])
-    batch_size    = batch_size  if batch_size  is not None else cfg["training"]["batch_size"]
-    num_workers   = num_workers if num_workers is not None else d_cfg["num_workers"]
-    input_res     = cfg["model"]["input_resolution"]
+    csv_path          = Path(csv_path      if csv_path      is not None else d_cfg["csv_path"])
+    artifact_root     = Path(artifact_root if artifact_root is not None else d_cfg["artifact_root"])
+    batch_size        = batch_size  if batch_size  is not None else cfg["training"]["batch_size"]
+    num_workers       = num_workers if num_workers is not None else d_cfg["num_workers"]
+    input_res         = cfg["model"]["input_resolution"]
+    samples_per_epoch = cfg["training"].get("samples_per_epoch", None)
 
     # ------------------------------------------------------------------ #
     # Datasets                                                             #
@@ -69,11 +56,12 @@ def get_dataloaders(
     # Weighted sampler — inverse class frequency on the training set       #
     # ------------------------------------------------------------------ #
     #
-    # The training set is imbalanced across the 7 classes.
-    # WeightedRandomSampler rebalances this so each class contributes
-    # roughly equally to every epoch.
+    # samples_per_epoch caps how many samples are drawn per epoch.
+    # With replacement=True the sampler can draw the same image multiple
+    # times, but the weighting ensures all 7 classes are equally represented
+    # regardless of how many images each class actually has.
     #
-    train_sampler = _make_weighted_sampler(datasets["train"])
+    train_sampler = _make_weighted_sampler(datasets["train"], samples_per_epoch)
 
     # ------------------------------------------------------------------ #
     # DataLoaders                                                          #
@@ -84,10 +72,12 @@ def get_dataloaders(
         "train": DataLoader(
             datasets["train"],
             batch_size=batch_size,
-            sampler=train_sampler,   # mutually exclusive with shuffle=True
+            sampler=train_sampler,
             num_workers=num_workers,
             pin_memory=pin,
             drop_last=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         ),
         "validation": DataLoader(
             datasets["validation"],
@@ -95,6 +85,8 @@ def get_dataloaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         ),
         "test": DataLoader(
             datasets["test"],
@@ -102,6 +94,8 @@ def get_dataloaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         ),
     }
 
@@ -120,10 +114,20 @@ def _load_config(config_path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
-def _make_weighted_sampler(dataset: ArtiFactDataset) -> WeightedRandomSampler:
+def _make_weighted_sampler(
+    dataset: ArtiFactDataset,
+    num_samples: Optional[int] = None,
+) -> WeightedRandomSampler:
     """
-    Compute per-sample weights as the inverse frequency of their class,
-    then return a WeightedRandomSampler over the full training set.
+    Compute per-sample weights as inverse class frequency and return a
+    WeightedRandomSampler.
+
+    Parameters
+    ----------
+    num_samples : int, optional
+        Number of samples to draw per epoch.  Defaults to the full dataset
+        size.  Set this to a smaller value (e.g. 500_000) to cap epoch
+        length when the training set is very large.
     """
     counts = dataset.get_class_counts()
     class_weights = [
@@ -133,6 +137,6 @@ def _make_weighted_sampler(dataset: ArtiFactDataset) -> WeightedRandomSampler:
     sample_weights = [class_weights[label] for _, label in dataset.samples]
     return WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=len(sample_weights),
+        num_samples=num_samples if num_samples is not None else len(sample_weights),
         replacement=True,
     )
