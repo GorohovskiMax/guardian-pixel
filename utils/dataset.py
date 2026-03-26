@@ -25,39 +25,79 @@ CLASS_NAMES: list[str] = [
 
 NUM_CLASSES = len(CLASS_NAMES)
 
+# Module-level cache — the file index is built once per session and reused
+# across all three ArtiFactDataset instances (train / validation / test).
+_file_index_cache: dict[str, dict[str, list[str]]] = {}
+
 
 # --------------------------------------------------------------------------- #
 # Path resolution                                                              #
 # --------------------------------------------------------------------------- #
 
-def _build_prefix_map(artifact_root: Path) -> dict[str, str]:
+def _build_file_index(artifact_root: Path) -> dict[str, list[str]]:
     """
-    Scan one level deep under artifact_root and return a mapping from
-    subfolder name → parent folder name for any subfolder that is NOT itself
-    a top-level folder.
+    Walk the entire ArtiFact tree once and build a filename index.
 
-    Example: artifact_root/glide/glide-t2i/ exists but glide-t2i/ does not
-    exist at the top level, so the map contains {"glide-t2i": "glide"}.
+    Returns
+    -------
+    dict mapping filename (e.g. "img001158.jpg") → list of relative paths
+    from artifact_root where that file exists on disk.
 
-    This lets us resolve CSV image_path values that are relative to a
-    generator parent folder rather than to artifact_root directly.
+    This handles arbitrary nesting depths transparently — no matter how
+    many subdirectory levels a generator uses, its images will be found.
+    The index is cached at module level so it is built only once per session.
     """
-    top_level = {p.name for p in artifact_root.iterdir() if p.is_dir()}
-    prefix_map: dict[str, str] = {}
-    for folder in top_level:
-        for sub in (artifact_root / folder).iterdir():
-            if sub.is_dir() and sub.name not in top_level:
-                prefix_map[sub.name] = folder
-    return prefix_map
+    print("[ArtiFactDataset] Building file index (one-time per session)...", flush=True)
+    index: dict[str, list[str]] = {}
+    for p in artifact_root.rglob("*.jpg"):
+        rel = str(p.relative_to(artifact_root)).replace("\\", "/")
+        fname = p.name
+        if fname not in index:
+            index[fname] = []
+        index[fname].append(rel)
+    total = sum(len(v) for v in index.values())
+    print(f"[ArtiFactDataset] Index ready: {total:,} images.", flush=True)
+    return index
 
 
-def _resolve_path(artifact_root: Path, image_path: str, prefix_map: dict[str, str]) -> str:
-    """Return the absolute path for an image, inserting a parent folder when needed."""
-    prefix = image_path.split("/")[0]
-    parent = prefix_map.get(prefix, "")
-    if parent:
-        return str(artifact_root / parent / image_path)
-    return str(artifact_root / image_path)
+def _get_file_index(artifact_root: Path) -> dict[str, list[str]]:
+    """Return the cached file index, building it first if necessary."""
+    key = str(artifact_root)
+    if key not in _file_index_cache:
+        _file_index_cache[key] = _build_file_index(artifact_root)
+    return _file_index_cache[key]
+
+
+def _resolve_path(artifact_root: Path, image_path: str, file_index: dict[str, list[str]]) -> str:
+    """
+    Resolve a CSV image_path to an absolute disk path.
+
+    Strategy
+    --------
+    1. Extract the filename from image_path.
+    2. Look it up in the file index (all known disk locations).
+    3. If only one match exists, use it directly.
+    4. If multiple matches exist (same filename in different generators),
+       pick the candidate whose path shares the most components with the
+       original CSV image_path — this reliably selects the correct generator.
+    5. If no match exists, return the direct path so the caller gets a
+       clear FileNotFoundError with the attempted path.
+    """
+    fname = Path(image_path).name
+    candidates = file_index.get(fname, [])
+
+    if not candidates:
+        # File not found anywhere on disk — return direct path for a clear error.
+        return str(artifact_root / image_path)
+
+    if len(candidates) == 1:
+        return str(artifact_root / candidates[0])
+
+    # Multiple files share this filename — pick the one whose path components
+    # overlap most with the original CSV image_path.
+    original_parts = set(image_path.replace("\\", "/").split("/"))
+    best = max(candidates, key=lambda c: len(original_parts & set(c.split("/"))))
+    return str(artifact_root / best)
 
 
 # --------------------------------------------------------------------------- #
@@ -70,12 +110,12 @@ class ArtiFactDataset(Dataset):
 
     Data access
     -----------
-    All metadata is read from a single master CSV file.  Images are never
-    copied or reorganised — each image is fetched directly by constructing:
+    All metadata is read from a single master CSV file.  Images are fetched
+    directly by resolving each ``image_path`` value against the disk.
 
-        artifact_root / image_path
-
-    where ``image_path`` is the value stored in the master CSV.
+    Path resolution is done via a full file index built by walking
+    ``artifact_root`` once at startup.  This handles any nesting depth
+    transparently — no generator-specific path knowledge is required.
 
     Parameters
     ----------
@@ -83,8 +123,7 @@ class ArtiFactDataset(Dataset):
         Path to master_metadata.csv (on Google Drive or local).
     artifact_root : str | Path
         Root directory where the ArtiFact zip was extracted, e.g.
-        ``/content/ArtiFact``.  Every ``image_path`` in the CSV is
-        relative to this root.
+        ``/content/ArtiFact``.
     split : str
         One of ``"train"``, ``"validation"``, ``"test"``.
     transform : callable, optional
@@ -106,18 +145,13 @@ class ArtiFactDataset(Dataset):
         self.transform     = transform
         self.class_names   = CLASS_NAMES
 
-        df = self._load_split(Path(csv_path), split)
-
-        # Some generators are nested one level inside a parent folder on disk
-        # (e.g. image_path starts with "glide-t2i/" but on disk the file lives
-        # under "glide/glide-t2i/").  Build a one-time prefix map at startup
-        # to resolve these transparently without touching the CSV.
-        prefix_map = _build_prefix_map(self.artifact_root)
+        df         = self._load_split(Path(csv_path), split)
+        file_index = _get_file_index(self.artifact_root)
 
         # Each sample is a (absolute_image_path, class_label) tuple.
         self.samples: list[tuple[str, int]] = list(
             zip(
-                (_resolve_path(self.artifact_root, p, prefix_map) for p in df["image_path"]),
+                (_resolve_path(self.artifact_root, p, file_index) for p in df["image_path"]),
                 df["target"].tolist(),
             )
         )
